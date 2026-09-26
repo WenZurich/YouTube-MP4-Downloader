@@ -18,7 +18,7 @@ concurrency:
 
 env:
   APP_NAME: "Video Downloader"
-  APP_VERSION: "2.5.0"
+  APP_VERSION: "2.6.0"
 
 jobs:
   build-windows:
@@ -195,6 +195,31 @@ jobs:
           opts = worker._build_options(mod.imageio_ffmpeg.get_ffmpeg_exe())
           worker._apply_title_output(opts, 'Sample: Title? 1080p')
           assert opts['outtmpl'].endswith('Sample Title 1080p.%(ext)s')
+
+          assert mod.is_avple_url('https://avple.tv/video/102381106165343')
+          page_fixture = '''
+          <html><head><title>Fallback title</title></head><body>
+          <script type="application/json">
+          {"props":{"pageProps":{"instance":{"title":"Readable Page Title","play":"https://media.example.com/path/master.m3u8"}}}}
+          </script>
+          <script>source = 'https://cdn.example.com/media/video.m3u8';</script>
+          </body></html>
+          '''
+          meta = mod._extract_avple_json_metadata(page_fixture)
+          assert meta['title'] == 'Readable Page Title'
+          assert mod._extract_avple_source(
+              page_fixture, 'https://avple.tv/video/123'
+          ) == 'https://cdn.example.com/media/video.m3u8'
+
+          metadata_only_fixture = '''
+          <script type="application/json">
+          {"props":{"pageProps":{"instance":{"title":"Metadata Title","play":"hls/abc/playlist.m3u8"}}},
+           "assetPrefix":"https://assets.example.com/file/media"}
+          </script>
+          '''
+          assert mod._extract_avple_source(
+              metadata_only_fixture, 'https://avple.tv/video/123'
+          ) == 'https://assets.example.com/file/media/hls/abc/playlist.m3u8'
 
           print('Site-specific HLS resolver fixture OK')
           '@ | Set-Content -Encoding utf8 test_missav_fixture.py
@@ -550,18 +575,18 @@ jobs:
           @'
           VSVersionInfo(
             ffi=FixedFileInfo(
-              filevers=(2,5,0,0), prodvers=(2,5,0,0), mask=0x3f,
+              filevers=(2,6,0,0), prodvers=(2,6,0,0), mask=0x3f,
               flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0,0)
             ),
             kids=[
               StringFileInfo([StringTable(u'040904B0', [
                 StringStruct(u'CompanyName', u'WenZurich'),
                 StringStruct(u'FileDescription', u'Video Downloader'),
-                StringStruct(u'FileVersion', u'2.5.0'),
+                StringStruct(u'FileVersion', u'2.6.0'),
                 StringStruct(u'InternalName', u'Video Downloader'),
                 StringStruct(u'OriginalFilename', u'Video Downloader.exe'),
                 StringStruct(u'ProductName', u'Video Downloader'),
-                StringStruct(u'ProductVersion', u'2.5.0')
+                StringStruct(u'ProductVersion', u'2.6.0')
               ])]),
               VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
             ]
@@ -624,10 +649,10 @@ jobs:
       - name: Upload portable Windows build
         uses: actions/upload-artifact@v4
         with:
-          name: Video-Downloader-Windows-x64-v2.5.0-portable
+          name: Video-Downloader-Windows-x64-v2.6.0-portable
           path: |
-            dist/Video-Downloader-v2.5.0-Windows-x64-portable.zip
-            dist/Video-Downloader-v2.5.0-Windows-x64-portable.zip.sha256.txt
+            dist/Video-Downloader-v2.6.0-Windows-x64-portable.zip
+            dist/Video-Downloader-v2.6.0-Windows-x64-portable.zip.sha256.txt
           if-no-files-found: error
           retention-days: 30
 
@@ -644,9 +669,9 @@ jobs:
           $notes = @"
           Portable Windows x64 build.
 
-          v2.5.0 refines the download-manager interface for large queues, keeps long URLs and titles from distorting the layout, and uses page/video titles for readable output filenames when metadata is available.
+          v2.6.0 expands site-specific player compatibility while keeping readable title-based filenames and the queue-first desktop interface.
 
-          Site-specific HLS compatibility and lossless HLS-to-MP4 remuxing remain supported.
+          Site-specific HLS/direct-media compatibility and lossless HLS-to-MP4 remuxing remain supported.
 
           Every download still runs in a separate worker process. Unsupported sites, yt-dlp exceptions, and even a hard worker-process crash are isolated to the affected queue item; the GUI stays alive and continues the queue.
 

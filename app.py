@@ -9,7 +9,7 @@ import time
 import traceback
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from curl_cffi import requests as browser_requests
 import imageio_ffmpeg
@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "Video Downloader"
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.6.0"
 ORG_NAME = "WenZurich"
 
 # ---------------------------------------------------------------------------
@@ -604,6 +604,16 @@ MISSAV_HLS_RE = re.compile(
     re.IGNORECASE,
 )
 
+AVPLE_DOMAINS = ("avple.tv",)
+AVPLE_SOURCE_RE = re.compile(
+    r"\bsource\s*=\s*(['\"])(?P<url>.+?)\1",
+    re.IGNORECASE | re.DOTALL,
+)
+AVPLE_JSON_RE = re.compile(
+    r"<script[^>]+type=['\"]application/json['\"][^>]*>(?P<json>.*?)</script>",
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 def _domain_matches(host, domains):
     host = (host or "").lower().rstrip(".")
@@ -617,6 +627,16 @@ def is_missav_url(url):
         return False
     return parsed.scheme in ("http", "https") and _domain_matches(
         parsed.hostname, MISSAV_DOMAINS
+    )
+
+
+def is_avple_url(url):
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    return parsed.scheme in ("http", "https") and _domain_matches(
+        parsed.hostname, AVPLE_DOMAINS
     )
 
 
@@ -775,6 +795,169 @@ def resolve_missav_stream(page_url, timeout=30):
     }
 
 
+def _extract_avple_json_metadata(html_text):
+    for match in AVPLE_JSON_RE.finditer(html_text or ""):
+        raw = match.group("json").strip()
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+
+        page_props = ((data or {}).get("props") or {}).get("pageProps") or {}
+        instance = page_props.get("instance") or {}
+        meta_info = page_props.get("metaInfo") or {}
+        title = _clean_title_text(
+            instance.get("title", "") or meta_info.get("siteTitle", "")
+        )
+        play = instance.get("play") or ""
+        asset_prefix = str((data or {}).get("assetPrefix") or "")
+        if title or play or asset_prefix:
+            return {
+                "title": title,
+                "play": str(play),
+                "asset_prefix": asset_prefix,
+            }
+    return {"title": "", "play": "", "asset_prefix": ""}
+
+
+def _extract_avple_source(html_text, page_url):
+    match = AVPLE_SOURCE_RE.search(html_text or "")
+    if match:
+        raw = (
+            match.group("url")
+            .replace("\\/", "/")
+            .replace("&amp;", "&")
+            .strip()
+        )
+        if raw:
+            return urljoin(page_url, raw)
+
+    meta = _extract_avple_json_metadata(html_text)
+    play = (meta.get("play") or "").replace("\\/", "/").strip()
+    if play.startswith(("http://", "https://", "//", "/")):
+        return urljoin(page_url, play)
+
+    asset_prefix = (meta.get("asset_prefix") or "").rstrip("/")
+    if play and asset_prefix:
+        # Older/current Next.js pages expose a relative media path in page
+        # metadata. The asset prefix is a useful fallback when inline player
+        # JavaScript is unavailable.
+        return f"{asset_prefix}/{play.lstrip('/')}"
+
+    candidates = re.findall(
+        r"https?://[^\s'\"<>\\;]+\.(?:m3u8|mp4)(?:\?[^\s'\"<>\\;]*)?",
+        (html_text or "").replace("\\/", "/"),
+        flags=re.IGNORECASE,
+    )
+    return candidates[0] if candidates else ""
+
+
+def resolve_avple_stream(page_url, timeout=30):
+    if not is_avple_url(page_url):
+        raise RuntimeError("SITE2_UNSUPPORTED_HOST")
+
+    base_headers = {
+        "User-Agent": MISSAV_BROWSER_UA,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    parsed_input = urlparse(page_url)
+    site_root = f"{parsed_input.scheme}://{parsed_input.netloc}/"
+
+    session = None
+    response = None
+    last_status = 0
+    # Some player pages are stricter about TLS/browser fingerprints than
+    # generic extractors. Try a small set of real browser profiles while
+    # preserving cookies from a root-page warm-up within each profile.
+    for profile in ("chrome", "safari", "chrome_android"):
+        candidate = browser_requests.Session(
+            impersonate=profile,
+            headers=base_headers,
+        )
+        try:
+            candidate.get(
+                site_root,
+                timeout=min(timeout, 12),
+                allow_redirects=True,
+            )
+        except Exception:
+            pass
+        try:
+            candidate_response = candidate.get(
+                page_url,
+                headers={**base_headers, "Referer": site_root},
+                timeout=timeout,
+                allow_redirects=True,
+            )
+        except Exception:
+            continue
+        last_status = candidate_response.status_code
+        if candidate_response.status_code == 200:
+            session = candidate
+            response = candidate_response
+            break
+
+    if response is None:
+        raise RuntimeError(f"SITE2_PAGE_HTTP_{last_status or 'NETWORK'}")
+
+    final_url = str(response.url)
+    if not is_avple_url(final_url):
+        raise RuntimeError("SITE2_REDIRECTED_TO_UNSUPPORTED_HOST")
+
+    meta = _extract_avple_json_metadata(response.text)
+    page_title = meta.get("title") or extract_page_title(response.text)
+    stream_url = _extract_avple_source(response.text, final_url)
+    if not stream_url:
+        raise RuntimeError("SITE2_STREAM_NOT_FOUND")
+
+    parsed_page = urlparse(final_url)
+    request_headers = {
+        "User-Agent": MISSAV_BROWSER_UA,
+        "Referer": final_url,
+        "Origin": f"{parsed_page.scheme}://{parsed_page.netloc}",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    cookies = session.cookies.get_dict()
+    if cookies:
+        request_headers["Cookie"] = "; ".join(
+            f"{name}={value}" for name, value in cookies.items()
+        )
+
+    stream_path = urlparse(stream_url).path.lower()
+    if stream_path.endswith(".m3u8"):
+        probe = session.get(
+            stream_url,
+            headers=request_headers,
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        if probe.status_code != 200:
+            raise RuntimeError(f"SITE2_HLS_HTTP_{probe.status_code}")
+        if "#EXTM3U" not in probe.text[:8192]:
+            raise RuntimeError("SITE2_HLS_INVALID_PLAYLIST")
+    else:
+        probe_headers = dict(request_headers)
+        probe_headers["Range"] = "bytes=0-4095"
+        probe = session.get(
+            stream_url,
+            headers=probe_headers,
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        if probe.status_code not in (200, 206):
+            raise RuntimeError(f"SITE2_MEDIA_HTTP_{probe.status_code}")
+        if not probe.content:
+            raise RuntimeError("SITE2_MEDIA_EMPTY")
+
+    return {
+        "url": stream_url,
+        "page_url": final_url,
+        "headers": request_headers,
+        "title": _clean_title_text(page_title),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Download worker
 # ---------------------------------------------------------------------------
@@ -897,6 +1080,10 @@ class DownloadWorker(QObject):
         return is_missav_url(url)
 
     @staticmethod
+    def _is_avple_url(url):
+        return is_avple_url(url)
+
+    @staticmethod
     def _is_youtube_url(url):
         low = (url or "").lower()
         return (
@@ -997,6 +1184,23 @@ class DownloadWorker(QObject):
                     self.i18n.tr("missav_ready"),
                     self.i18n.tr("missav_ready_detail"),
                 )
+            elif self._is_avple_url(self.url):
+                self.progress.emit(
+                    0.0,
+                    self.i18n.tr("missav_resolving"),
+                    self.i18n.tr("missav_resolving_detail"),
+                )
+                resolved = resolve_avple_stream(self.url)
+                download_url = resolved["url"]
+                resolved_headers = resolved["headers"]
+                resolved_title = _clean_title_text(resolved.get("title", ""))
+                if resolved_title:
+                    self.media_title = resolved_title
+                self.progress.emit(
+                    0.0,
+                    self.i18n.tr("missav_ready"),
+                    self.i18n.tr("missav_ready_detail"),
+                )
 
             options = self._build_options(ffmpeg_exe)
             if resolved_headers:
@@ -1056,6 +1260,8 @@ class DownloadWorker(QObject):
             or "unable to extract" in low
             or "missav_stream_not_found" in low
             or "missav_redirected_to_unsupported_host" in low
+            or "site2_stream_not_found" in low
+            or "site2_redirected_to_unsupported_host" in low
         ):
             return "err_unsupported|" + msg
         return "err_generic|" + msg
