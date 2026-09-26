@@ -846,10 +846,45 @@ def resolve_avple_stream(page_url, timeout=30):
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
-    session = browser_requests.Session(impersonate="chrome", headers=base_headers)
-    response = session.get(page_url, timeout=timeout, allow_redirects=True)
-    if response.status_code != 200:
-        raise RuntimeError(f"SITE2_PAGE_HTTP_{response.status_code}")
+    parsed_input = urlparse(page_url)
+    site_root = f"{parsed_input.scheme}://{parsed_input.netloc}/"
+
+    session = None
+    response = None
+    last_status = 0
+    # Some player pages are stricter about TLS/browser fingerprints than
+    # generic extractors. Try a small set of real browser profiles while
+    # preserving cookies from a root-page warm-up within each profile.
+    for profile in ("chrome", "safari", "chrome_android"):
+        candidate = browser_requests.Session(
+            impersonate=profile,
+            headers=base_headers,
+        )
+        try:
+            candidate.get(
+                site_root,
+                timeout=min(timeout, 12),
+                allow_redirects=True,
+            )
+        except Exception:
+            pass
+        try:
+            candidate_response = candidate.get(
+                page_url,
+                headers={**base_headers, "Referer": site_root},
+                timeout=timeout,
+                allow_redirects=True,
+            )
+        except Exception:
+            continue
+        last_status = candidate_response.status_code
+        if candidate_response.status_code == 200:
+            session = candidate
+            response = candidate_response
+            break
+
+    if response is None:
+        raise RuntimeError(f"SITE2_PAGE_HTTP_{last_status or 'NETWORK'}")
 
     final_url = str(response.url)
     if not is_avple_url(final_url):
