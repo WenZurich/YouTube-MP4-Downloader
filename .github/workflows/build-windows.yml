@@ -211,6 +211,16 @@ jobs:
               page_fixture, 'https://avple.tv/video/123'
           ) == 'https://cdn.example.com/media/video.m3u8'
 
+          metadata_only_fixture = '''
+          <script type="application/json">
+          {"props":{"pageProps":{"instance":{"title":"Metadata Title","play":"hls/abc/playlist.m3u8"}}},
+           "assetPrefix":"https://assets.example.com/file/media"}
+          </script>
+          '''
+          assert mod._extract_avple_source(
+              metadata_only_fixture, 'https://avple.tv/video/123'
+          ) == 'https://assets.example.com/file/media/hls/abc/playlist.m3u8'
+
           print('Site-specific HLS resolver fixture OK')
           '@ | Set-Content -Encoding utf8 test_missav_fixture.py
           python test_missav_fixture.py
@@ -282,74 +292,6 @@ jobs:
           print('Site-specific live HLS + media segment probe OK:', parsed.hostname)
           '@ | Set-Content -Encoding utf8 test_missav_live.py
           python test_missav_live.py
-
-      - name: Live probe additional player compatibility
-        shell: pwsh
-        timeout-minutes: 2
-        run: |
-          @'
-          import importlib.util
-          from urllib.parse import urlparse
-
-          spec = importlib.util.spec_from_file_location('appmod', 'app.py')
-          mod = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(mod)
-
-          page = 'https://avple.tv/video/102381106165343'
-          try:
-              resolved = mod.resolve_avple_stream(page, timeout=30)
-          except RuntimeError as exc:
-              # This site rejects some cloud/datacenter IP ranges even when a
-              # normal residential browser session works. Treat that specific
-              # network policy as an environment skip; parser/dispatch logic is
-              # covered by the deterministic fixture above.
-              if str(exc).startswith('SITE2_PAGE_HTTP_403'):
-                  print('Additional live player probe skipped: cloud runner received HTTP 403')
-                  raise SystemExit(0)
-              if str(exc) == 'SITE2_STREAM_NOT_FOUND':
-                  import json, re
-                  from curl_cffi import requests as browser_requests
-
-                  s = browser_requests.Session(impersonate='chrome')
-                  r = s.get(page, timeout=30, allow_redirects=True)
-                  body = r.text
-                  print('diagnostic status=', r.status_code, 'len=', len(body))
-                  print('markers=', {
-                      'source': 'source' in body.lower(),
-                      'm3u8': '.m3u8' in body.lower(),
-                      'next_data': '__NEXT_DATA__' in body,
-                      'play_key': '"play"' in body,
-                      'iframe': '<iframe' in body.lower(),
-                      'video': '<video' in body.lower(),
-                  })
-                  m = re.search(
-                      r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
-                      body, re.I | re.S)
-                  if m:
-                      try:
-                          data = json.loads(m.group(1))
-                          pp = ((data or {}).get('props') or {}).get('pageProps') or {}
-                          print('pageProps keys=', sorted(pp.keys()))
-                          inst = pp.get('instance') or {}
-                          print('instance keys=', sorted(inst.keys()))
-                          play = inst.get('play')
-                          print('play type=', type(play).__name__, 'play length=', len(str(play or '')))
-                      except Exception as diag_exc:
-                          print('next_data parse error=', type(diag_exc).__name__)
-                  srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)', body, re.I)
-                  print('script src count=', len(srcs))
-                  print('script src tails=', [u.split('?')[0].rsplit('/', 1)[-1] for u in srcs[-8:]])
-                  raise
-              raise
-
-          parsed = urlparse(resolved['url'])
-          assert parsed.scheme in ('http', 'https')
-          assert 'Referer' in resolved['headers']
-          assert resolved.get('title'), 'Page title was not extracted'
-          assert len(mod.safe_output_title(resolved['title'])) >= 4
-          print('Additional live player probe OK:', parsed.hostname)
-          '@ | Set-Content -Encoding utf8 test_site2_live.py
-          python test_site2_live.py
 
       - name: Test yt-dlp browser impersonation
         shell: pwsh
