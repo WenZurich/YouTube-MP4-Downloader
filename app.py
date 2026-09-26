@@ -805,11 +805,19 @@ def _extract_avple_json_metadata(html_text):
 
         page_props = ((data or {}).get("props") or {}).get("pageProps") or {}
         instance = page_props.get("instance") or {}
-        title = _clean_title_text(instance.get("title", ""))
+        meta_info = page_props.get("metaInfo") or {}
+        title = _clean_title_text(
+            instance.get("title", "") or meta_info.get("siteTitle", "")
+        )
         play = instance.get("play") or ""
-        if title or play:
-            return {"title": title, "play": str(play)}
-    return {"title": "", "play": ""}
+        asset_prefix = str((data or {}).get("assetPrefix") or "")
+        if title or play or asset_prefix:
+            return {
+                "title": title,
+                "play": str(play),
+                "asset_prefix": asset_prefix,
+            }
+    return {"title": "", "play": "", "asset_prefix": ""}
 
 
 def _extract_avple_source(html_text, page_url):
@@ -828,6 +836,13 @@ def _extract_avple_source(html_text, page_url):
     play = (meta.get("play") or "").replace("\\/", "/").strip()
     if play.startswith(("http://", "https://", "//", "/")):
         return urljoin(page_url, play)
+
+    asset_prefix = (meta.get("asset_prefix") or "").rstrip("/")
+    if play and asset_prefix:
+        # Older/current Next.js pages expose a relative media path in page
+        # metadata. The asset prefix is a useful fallback when inline player
+        # JavaScript is unavailable.
+        return f"{asset_prefix}/{play.lstrip('/')}"
 
     candidates = re.findall(
         r"https?://[^\s'\"<>\\;]+\.(?:m3u8|mp4)(?:\?[^\s'\"<>\\;]*)?",
